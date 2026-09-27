@@ -69,10 +69,62 @@ function wait(signal: AbortSignal) {
   });
 }
 
+// ACT: 任务提交（POST generateImage/Video）撞 429 时按 5s→10s→20s→40s 递增退避重试，
+// 最多 4 次，越过 TF-router 限流冷却窗口。轮询查询保持原 3s 短间隔，不退避。
+const rateLimitMaxRetries = 4;
+
+async function submitTask(
+  context: ProviderContext,
+  path: string,
+  body: unknown,
+  signal: AbortSignal,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; ; attempt++) {
+    signal.throwIfAborted();
+    const response = await context.tool.fetch(`${apiUrl}/${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey(context)}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (response.status === 429) {
+      if (attempt >= rateLimitMaxRetries) throw new Error("TF-router 请求持续 429 限流，请稍后再试");
+      await waitMs(signal, 5000 * 2 ** attempt);
+      continue;
+    }
+    if (!response.ok) throw new Error(`TF-router 请求失败（HTTP ${response.status}）`);
+    return object(await response.json());
+  }
+}
+
+function waitMs(signal: AbortSignal, ms: number) {
+  signal.throwIfAborted();
+  return new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+function apiKey(context: ProviderContext): string {
+  const key =
+    typeof context.config.apiKey === "string"
+      ? context.config.apiKey.trim().replace(/^Bearer\s+/i, "").trim()
+      : "";
+  if (!key) throw new Error("请填写 TF-router API Key");
+  return key;
+}
+
 async function generateTask(context: ProviderContext, mediaType: "image" | "video", body: unknown) {
   // ACT: 单次生成最多等待 30 分钟；供应商开放任务恢复能力后再单独保存任务 ID。
   const signal = AbortSignal.any([AbortSignal.timeout(30 * 60_000), ...(context.signal ? [context.signal] : [])]);
-  const task = await fetchJson(context, `${mediaType}/generate${mediaType === "image" ? "Image" : "Video"}`, body, signal);
+  const task = await submitTask(context, `${mediaType}/generate${mediaType === "image" ? "Image" : "Video"}`, body, signal);
   if (typeof task.data !== "string" || !task.data.trim()) throw new Error("TF-router 未返回任务 ID");
   while (true) {
     const result = await fetchJson(context, `${mediaType}/get${mediaType === "image" ? "Image" : "Video"}Status`, { taskICode: task.data }, signal);
